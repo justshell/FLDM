@@ -1,0 +1,175 @@
+- name: collect starting values
+  set_fact:
+    data_on_repo_dict: {}
+    data_on_repo_files: []
+    data_on_repo_dirs: []
+    data_on_repo_links: []
+    data_on_host_dict: {}
+    data_on_host_files: []
+    data_on_host_dirs: []
+    data_on_host_links: []
+    repo_find_path: "{{ sync_dirs[item]['src']~'/'|dirname }}"
+    host_find_path: "{{ sync_dirs[item]['dest']~'/'|dirname }}"
+    checksum_algorithm: "{{ FLDM_sync_dirs_checksum_algorithm | default('md5') }}"
+    hide_log: True
+
+- name: collect raw data for dir configuration on host (content)
+  ansible.builtin.find:
+    paths: "{{ host_find_path }}"
+    recurse: True
+    file_type: "any"
+  register: "host_data"
+
+- name: converting host data to lists and dicts
+  set_fact:
+    data_on_host_dict: "{{ data_on_host_dict|combine(
+        {
+        element.path|replace(host_find_path,''):
+            {
+            'owner':element.pw_name,
+            'group':element.gr_name,
+            'mode':element.mode
+            }
+        }
+      )
+    }}"
+    data_on_host_files: "{{ data_on_host_files + ([element.path|replace(host_find_path,'')] if element.isreg else []) }}"
+    data_on_host_dirs: "{{ data_on_host_dirs + ([element.path|replace(host_find_path,'')] if element.isdir else []) }}"
+    data_on_host_links: "{{ data_on_host_links + ([element.path|replace(host_find_path,'')] if element.islnk else []) }}"
+  loop: "{{host_data.files}}"
+  loop_control:
+    loop_var: "element"
+  no_log: "{{ hide_log }}"
+
+- name: collect raw data for dir configuration on host (file stat)
+  ansible.builtin.stat:
+    path: "{{host_find_path}}{{file}}"
+    get_attributes: False
+    get_mime: False
+    checksum_algorithm: "{{checksum_algorithm}}"
+  loop: "{{data_on_host_files}}"
+  loop_control:
+    loop_var: 'file'
+  register: "host_stats"
+
+- name: enrich host dict with checksums for files
+  set_fact:
+    data_on_host_dict: "{{ data_on_host_dict | combine({ stat_data.file:{'hash':stat_data.stat.checksum}},recursive=True) }}"
+  loop: "{{ host_stats.results }}"
+  loop_control:
+    loop_var: "stat_data"
+  no_log: "{{ hide_log }}"
+
+- name: collect raw data for dir configuration on repo (content)
+  become: False
+  connection: local
+  local_action:
+    module: "ansible.builtin.find"
+    paths: "{{ repo_find_path }}"
+    recurse: True
+    file_type: "any"
+  register: "repo_data"
+
+- name: converting repo data to lists and dicts
+  set_fact:
+    data_on_repo_dict: "{{ data_on_repo_dict|combine({ repo_item.path|replace(repo_find_path,''):repo_item }) }}"
+    data_on_repo_files: "{{ data_on_repo_files + ([repo_item.path|replace(repo_find_path,'')] if repo_item.isreg else []) }}"
+    data_on_repo_dirs: "{{ data_on_repo_dirs + ([repo_item.path|replace(repo_find_path,'')] if repo_item.isdir else []) }}"
+    data_on_repo_links: "{{ data_on_repo_links + ([repo_item.path|replace(repo_find_path,'')] if repo_item.islnk else []) }}"
+  loop: "{{repo_data.files}}"
+  loop_control:
+    loop_var: 'repo_item'
+  no_log: "{{ hide_log }}"
+
+- name: collect raw data for dir configuration on repo (stat files)
+  become: False
+  connection: local
+  local_action:
+    module: "ansible.builtin.stat"
+    path: "{{repo_find_path}}{{repo_item}}"
+    get_attributes: False
+    get_mime: False
+    checksum_algorithm: "{{checksum_algorithm}}"
+  loop: "{{data_on_repo_files}}"
+  loop_control:
+    loop_var: 'repo_item'
+  register: "repo_stats"
+
+- name: collect raw data for dir configuration on repo (stat links)
+  become: False
+  connection: local
+  local_action:
+    module: "ansible.builtin.stat"
+    path: "{{repo_find_path}}{{repo_item}}"
+    get_attributes: False
+    get_mime: False
+  loop: "{{data_on_repo_links}}"
+  loop_control:
+    loop_var: 'repo_item'
+  register: "repo_stats_links"
+
+- name: enrich repo dict with files checksums
+  set_fact:
+    data_on_repo_dict: "{{ data_on_repo_dict | combine({ stat_data.repo_item:{'hash':stat_data.stat.checksum}},recursive=True) }}"
+  loop: "{{ repo_stats.results }}"
+  loop_control:
+    loop_var: "stat_data"
+  no_log: "{{ hide_log }}"
+
+- name: enrich repo dict with links destinations
+  set_fact:
+    data_on_repo_dict: "{{ data_on_repo_dict | combine({ stat_data.item:{'dest':stat_data.stat.lnk_target}},recursive=True) }}"
+  loop: "{{ repo_stats_links.results }}"
+  loop_control:
+    loop_var: "stat_data"
+  no_log: "{{ hide_log }}"
+
+- name: calculating diff from repo and host
+  set_fact:
+    delete_files: "{{ data_on_host_files | difference(data_on_repo_files) }}"
+    delete_dirs: "{{ data_on_host_dirs | difference(data_on_repo_dirs) }}"
+    delete_links: "{{ data_on_host_links | difference(data_on_repo_links) }}"
+    new_files: "{{ data_on_repo_files | difference(data_on_host_files) }}"
+    new_dirs: "{{ data_on_repo_dirs | difference(data_on_host_dirs) }}"
+    new_links: "{{ data_on_repo_links | difference(data_on_host_links) }}"
+
+- name: delete deprecated files,dirs,links
+  file:
+    path: "{{host_find_path}}{{del_item}}"
+    state: absent
+  loop: "{{delete_files + delete_dirs + delete_links}}"
+  loop_control:
+    loop_var: 'del_item'
+
+- name: create dirs (new dirs only)
+  file:
+    path: "{{host_find_path}}{{item}}"
+    state: directory
+    owner: 'root'
+    group: 'root'
+    mode: '0755'
+  loop: "{{ new_dirs }}"
+
+- name: setup files (skip if checksums equals)
+  copy:
+    src: "{{repo_find_path}}{{update_file}}"
+    dest: "{{host_find_path}}{{update_file}}"
+    owner: "{{ data_on_host_dict[update_file].owner | default('root') }}"
+    group: "{{ data_on_host_dict[update_file].group | default('root') }}"
+    mode: "{{ data_on_host_dict[update_file].mode | default('0640') }}"
+  loop: "{{ data_on_repo_files }}"
+  loop_control:
+    loop_var: 'update_file'
+  when:
+    - data_on_host_dict[update_file] is undefined or data_on_repo_dict[update_file].hash != data_on_host_dict[update_file].hash
+
+- name: setup links
+  file:
+    src:  "{{data_on_repo_dict[link].dest}}"
+    dest: "{{host_find_path}}{{link_item}}"
+    force: True
+    state: "link"
+    follow: False
+  loop: "{{ data_on_repo_links }}"
+  loop_control:
+    loop_var: 'link_item'
